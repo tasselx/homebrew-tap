@@ -1,4 +1,4 @@
-cask "Keyden" do
+cask "keyden" do
   version "1.0.5"
   arch arm: "arm64", intel: "x86_64"
 
