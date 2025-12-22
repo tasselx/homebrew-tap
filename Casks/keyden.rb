@@ -15,6 +15,12 @@ cask "keyden" do
 
   app "Keyden.app"
 
+  # 安装后移除隔离属性，避免 Gatekeeper 报"已损坏"
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-cr", "#{appdir}/Keyden.app"]
+  end
+
   livecheck do
     url :url
     strategy :github_latest
