@@ -2,8 +2,8 @@ cask "keyden" do
   version "1.0.8"
   arch arm: "arm64", intel: "x86_64"
 
-  sha256 arm:   "ab6d0ed46ced035a64367805611c7362447ba541201d209a9809ec6153b1dedb",
-         intel: "a3f2d64f7efb61ee96344a5dae008b401fa89dc858245b84961e31c3165bd84f"
+  sha256 arm:   "2f6c6dc1d0b4e4900df12326355c395c2ac54275d3041ef96f3ff4bfd5e40fff",
+         intel: "bc9a1a9f69557ffdb441756e376cc2dceccdef0c14befa99341dc6ee8ed8b05b"
 
   url "https://github.com/tasselx/Keyden/releases/download/v#{version}/Keyden-#{version}-#{arch}.dmg",
       verified: "github.com/tasselx/Keyden/"
