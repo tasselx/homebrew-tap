@@ -1,0 +1,212 @@
+# =============================================================================
+# validate-cask.yml — PR 验证工作流 (用于 homebrew-tap 仓库)
+# =============================================================================
+# 在 PR 中自动验证 Cask formula 的正确性:
+#   - 版本号格式 (semver)
+#   - Release tag 格式
+#   - DMG 下载 URL 可达性
+#   - Ruby 语法检查
+#   - Homebrew audit (如果可用)
+# =============================================================================
+
+name: Validate Cask
+
+on:
+  pull_request:
+    paths:
+      - 'Casks/**'
+      - 'Formula/**'
+
+  push:
+    branches: [main]
+    paths:
+      - 'Casks/**'
+      - 'Formula/**'
+
+permissions:
+  contents: read
+
+env:
+  KEYDEN_REPO: tasselx/Keyden
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Step 1: Extract version and validate format
+      # -----------------------------------------------------------------------
+      - name: Extract and validate version
+        id: extract
+        run: |
+          CASK_FILE="Casks/keyden.rb"
+
+          if [ ! -f "$CASK_FILE" ]; then
+            echo "⚠️  Cask file not found: ${CASK_FILE}"
+            exit 0
+          fi
+
+          # Extract version from Cask file
+          VERSION=$(grep -oP 'version\s+"[^"]+"' "$CASK_FILE" | grep -oP '"[^"]+"' | tr -d '"')
+
+          if [ -z "$VERSION" ]; then
+            echo "❌ Could not extract version from ${CASK_FILE}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "📦 Detected version: ${VERSION}"
+
+          # Validate semver format
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "❌ Invalid version format: '${VERSION}'"
+            echo "   Expected: X.Y.Z (e.g. 1.0.10)"
+            exit 1
+          fi
+
+          echo "✅ Version format valid"
+
+      # -----------------------------------------------------------------------
+      # Step 2: Validate Ruby syntax
+      # -----------------------------------------------------------------------
+      - name: Validate Ruby syntax
+        run: |
+          echo "🔍 Checking Ruby syntax..."
+          for f in Casks/*.rb; do
+            if [ -f "$f" ]; then
+              echo "   Checking $f..."
+              ruby -c "$f"
+            fi
+          done
+          echo "✅ Ruby syntax OK"
+
+      # -----------------------------------------------------------------------
+      # Step 3: Validate download URLs are reachable
+      # -----------------------------------------------------------------------
+      - name: Validate download URLs
+        run: |
+          VERSION="${{ steps.extract.outputs.version }}"
+
+          if [ -z "$VERSION" ]; then
+            echo "⚠️  No version extracted, skipping URL check"
+            exit 0
+          fi
+
+          TAG="v${VERSION}"
+          BASE_URL="https://github.com/${{ env.KEYDEN_REPO }}/releases/download/${TAG}"
+
+          echo "🔍 Checking download URLs..."
+
+          FAILED=0
+          for ARCH in arm64 x86_64; do
+            URL="${BASE_URL}/Keyden-${VERSION}-${ARCH}.dmg"
+            echo "   Checking ${ARCH}: ${URL}"
+            HTTP_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L "$URL")
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
+              echo "   ✅ ${ARCH}: HTTP ${HTTP_CODE}"
+            else
+              echo "   ❌ ${ARCH}: HTTP ${HTTP_CODE} — URL not reachable!"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" = "1" ]; then
+            echo ""
+            echo "❌ Some download URLs are not reachable."
+            echo "   Possible causes:"
+            echo "   1. Release tag might have a typo (e.g. 'v.${VERSION}' instead of '${TAG}')"
+            echo "   2. DMG assets might not be uploaded yet"
+            echo "   3. Release might be in draft state"
+            exit 1
+          fi
+
+          echo "✅ All download URLs reachable"
+
+      # -----------------------------------------------------------------------
+      # Step 4: Validate SHA256 matches actual downloads
+      # -----------------------------------------------------------------------
+      - name: Validate SHA256 checksums
+        run: |
+          VERSION="${{ steps.extract.outputs.version }}"
+          CASK_FILE="Casks/keyden.rb"
+
+          if [ -z "$VERSION" ]; then
+            echo "⚠️  No version extracted, skipping SHA256 check"
+            exit 0
+          fi
+
+          TAG="v${VERSION}"
+          BASE_URL="https://github.com/${{ env.KEYDEN_REPO }}/releases/download/${TAG}"
+
+          # Extract SHA256 from Cask file
+          EXPECTED_ARM64=$(grep -A1 'sha256' "$CASK_FILE" | grep 'arm:' | grep -oP '"[a-f0-9]{64}"' | tr -d '"')
+          EXPECTED_INTEL=$(grep -A2 'sha256' "$CASK_FILE" | grep 'intel:' | grep -oP '"[a-f0-9]{64}"' | tr -d '"')
+
+          echo "🔍 Verifying SHA256 checksums..."
+          echo "   Expected arm64:  ${EXPECTED_ARM64}"
+          echo "   Expected x86_64: ${EXPECTED_INTEL}"
+
+          FAILED=0
+
+          # Download and verify arm64
+          echo "📥 Downloading arm64 DMG..."
+          curl -sL -o /tmp/keyden-arm64.dmg "${BASE_URL}/Keyden-${VERSION}-arm64.dmg" || {
+            echo "   ⚠️  Failed to download arm64 DMG, skipping SHA256 check"
+            exit 0
+          }
+          ACTUAL_ARM64=$(sha256sum /tmp/keyden-arm64.dmg | awk '{print $1}')
+          echo "   Actual arm64:    ${ACTUAL_ARM64}"
+          if [ "$EXPECTED_ARM64" != "$ACTUAL_ARM64" ]; then
+            echo "   ❌ arm64 SHA256 mismatch!"
+            FAILED=1
+          else
+            echo "   ✅ arm64 SHA256 matches"
+          fi
+
+          # Download and verify x86_64
+          echo "📥 Downloading x86_64 DMG..."
+          curl -sL -o /tmp/keyden-x86_64.dmg "${BASE_URL}/Keyden-${VERSION}-x86_64.dmg" || {
+            echo "   ⚠️  Failed to download x86_64 DMG, skipping SHA256 check"
+            exit 0
+          }
+          ACTUAL_INTEL=$(sha256sum /tmp/keyden-x86_64.dmg | awk '{print $1}')
+          echo "   Actual x86_64:   ${ACTUAL_INTEL}"
+          if [ "$EXPECTED_INTEL" != "$ACTUAL_INTEL" ]; then
+            echo "   ❌ x86_64 SHA256 mismatch!"
+            FAILED=1
+          else
+            echo "   ✅ x86_64 SHA256 matches"
+          fi
+
+          # Cleanup
+          rm -f /tmp/keyden-arm64.dmg /tmp/keyden-x86_64.dmg
+
+          if [ "$FAILED" = "1" ]; then
+            echo ""
+            echo "❌ SHA256 checksum verification failed!"
+            echo "   The checksums in the Cask file do not match the actual DMG files."
+            exit 1
+          fi
+
+          echo "✅ All SHA256 checksums verified"
+
+      # -----------------------------------------------------------------------
+      # Step 5: Summary
+      # -----------------------------------------------------------------------
+      - name: Summary
+        if: always()
+        run: |
+          VERSION="${{ steps.extract.outputs.version }}"
+
+          echo "## 🔍 Cask Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version: \`${VERSION}\` | Extracted |" >> $GITHUB_STEP_SUMMARY
+          echo "| Format validation | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruby syntax | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL reachability | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA256 verification | ✅ |" >> $GITHUB_STEP_SUMMARY

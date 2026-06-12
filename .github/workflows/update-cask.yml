@@ -1,0 +1,300 @@
+# =============================================================================
+# update-cask.yml — 自动更新 Homebrew Cask (用于 homebrew-tap 仓库)
+# =============================================================================
+# 触发方式:
+#   1. workflow_dispatch: 手动触发，输入版本号
+#   2. repository_dispatch: 由 Keyden 主仓库的 release workflow 调用
+#
+# 功能:
+#   - 验证版本号格式 (semver)
+#   - 验证 Release tag 格式 (vX.Y.Z)
+#   - 下载 DMG 并计算 SHA256
+#   - 自动更新 Casks/keyden.rb
+#   - 提交并推送更新
+# =============================================================================
+
+name: Update Keyden Cask
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g. 1.0.10, without "v" prefix)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run (validate only, do not commit)'
+        required: false
+        type: boolean
+        default: false
+
+  repository_dispatch:
+    types: [update-cask]
+
+permissions:
+  contents: write
+
+env:
+  KEYDEN_REPO: tasselx/Keyden
+  CASK_FILE: Casks/keyden.rb
+
+jobs:
+  update-cask:
+    runs-on: ubuntu-latest
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Determine version from input source
+      # -----------------------------------------------------------------------
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            VERSION="${{ github.event.client_payload.version }}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+
+          # Strip 'v' prefix if accidentally included
+          VERSION="${VERSION#v}"
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
+          echo "📦 Version: ${VERSION}"
+          echo "🏷️  Tag: v${VERSION}"
+
+      # -----------------------------------------------------------------------
+      # Step 2: Validate version format (strict semver: X.Y.Z)
+      # -----------------------------------------------------------------------
+      - name: Validate version format
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+
+          echo "🔍 Validating version format..."
+
+          # Check semver format
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "❌ Invalid version format: '$VERSION'"
+            echo "   Expected: X.Y.Z (e.g. 1.0.10)"
+            exit 1
+          fi
+
+          # Check tag format (must NOT have extra dots like v.1.0.10)
+          if echo "$TAG" | grep -qE '^v\.[0-9]'; then
+            echo "❌ Invalid tag format: '$TAG' (extra dot after 'v')"
+            echo "   Expected: vX.Y.Z (e.g. v1.0.10)"
+            exit 1
+          fi
+
+          echo "✅ Version format valid: ${VERSION}"
+          echo "✅ Tag format valid: ${TAG}"
+
+      # -----------------------------------------------------------------------
+      # Step 3: Verify Release exists and tag format is correct
+      # -----------------------------------------------------------------------
+      - name: Verify GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          echo "🔍 Checking if release '${TAG}' exists on ${{ env.KEYDEN_REPO }}..."
+
+          # Check if the release tag exists
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://api.github.com/repos/${{ env.KEYDEN_REPO }}/releases/tags/${TAG}")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Release '${TAG}' not found (HTTP ${HTTP_CODE})"
+            echo ""
+            echo "⚠️  Checking if there's a typo tag (e.g. 'v.${VERSION}')..."
+            TYPO_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://api.github.com/repos/${{ env.KEYDEN_REPO }}/releases/tags/v.${VERSION}")
+            if [ "$TYPO_CODE" = "200" ]; then
+              echo "⚠️  Found release with typo tag 'v.${VERSION}'!"
+              echo "   Please fix the tag first: git tag ${TAG} v.${VERSION} && git push origin ${TAG}"
+            fi
+            exit 1
+          fi
+
+          echo "✅ Release '${TAG}' exists"
+
+      # -----------------------------------------------------------------------
+      # Step 4: Verify DMG assets exist and download them
+      # -----------------------------------------------------------------------
+      - name: Download and verify DMG assets
+        id: assets
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          BASE_URL="https://github.com/${{ env.KEYDEN_REPO }}/releases/download/${TAG}"
+
+          ARM64_URL="${BASE_URL}/Keyden-${VERSION}-arm64.dmg"
+          INTEL_URL="${BASE_URL}/Keyden-${VERSION}-x86_64.dmg"
+
+          echo "🔍 Verifying DMG assets..."
+
+          # Check arm64 DMG
+          echo "   Checking arm64: ${ARM64_URL}"
+          ARM64_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L "$ARM64_URL")
+          if [ "$ARM64_CODE" != "200" ]; then
+            echo "❌ arm64 DMG not found (HTTP ${ARM64_CODE})"
+            echo "   URL: ${ARM64_URL}"
+            exit 1
+          fi
+          echo "   ✅ arm64 DMG exists"
+
+          # Check Intel DMG
+          echo "   Checking x86_64: ${INTEL_URL}"
+          INTEL_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L "$INTEL_URL")
+          if [ "$INTEL_CODE" != "200" ]; then
+            echo "❌ x86_64 DMG not found (HTTP ${INTEL_CODE})"
+            echo "   URL: ${INTEL_URL}"
+            exit 1
+          fi
+          echo "   ✅ x86_64 DMG exists"
+
+          # Download and compute SHA256
+          echo "📥 Downloading arm64 DMG..."
+          curl -sL -o /tmp/keyden-arm64.dmg "$ARM64_URL"
+          SHA256_ARM64=$(sha256sum /tmp/keyden-arm64.dmg | awk '{print $1}')
+          echo "   SHA256 (arm64): ${SHA256_ARM64}"
+
+          echo "📥 Downloading x86_64 DMG..."
+          curl -sL -o /tmp/keyden-x86_64.dmg "$INTEL_URL"
+          SHA256_INTEL=$(sha256sum /tmp/keyden-x86_64.dmg | awk '{print $1}')
+          echo "   SHA256 (x86_64): ${SHA256_INTEL}"
+
+          # Cleanup
+          rm -f /tmp/keyden-arm64.dmg /tmp/keyden-x86_64.dmg
+
+          echo "sha256_arm64=${SHA256_ARM64}" >> $GITHUB_OUTPUT
+          echo "sha256_intel=${SHA256_INTEL}" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "✅ All DMG assets verified"
+
+      # -----------------------------------------------------------------------
+      # Step 5: Checkout homebrew-tap repo
+      # -----------------------------------------------------------------------
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Step 6: Update Cask formula
+      # -----------------------------------------------------------------------
+      - name: Update Cask formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA256_ARM64="${{ steps.assets.outputs.sha256_arm64 }}"
+          SHA256_INTEL="${{ steps.assets.outputs.sha256_intel }}"
+
+          echo "📝 Updating ${CASK_FILE}..."
+          echo "   Version: ${VERSION}"
+          echo "   SHA256 (arm64): ${SHA256_ARM64}"
+          echo "   SHA256 (x86_64): ${SHA256_INTEL}"
+
+          # Generate new Cask file
+          cat > "${{ env.CASK_FILE }}" << 'CASK_EOF'
+          cask "keyden" do
+            version "VERSION_PLACEHOLDER"
+            arch arm: "arm64", intel: "x86_64"
+
+            sha256 arm:   "SHA256_ARM64_PLACEHOLDER",
+                   intel: "SHA256_INTEL_PLACEHOLDER"
+
+            url "https://github.com/tasselx/Keyden/releases/download/v#{version}/Keyden-#{version}-#{arch}.dmg",
+                verified: "github.com/tasselx/Keyden/"
+            name "Keyden"
+            desc "macOS menu bar TOTP authenticator"
+            homepage "https://tasselx.github.io/Keyden/"
+
+            depends_on macos: :monterey
+
+            app "Keyden.app"
+          end
+          CASK_EOF
+
+          # Replace placeholders (using | as sed delimiter to avoid conflicts)
+          sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" "${{ env.CASK_FILE }}"
+          sed -i "s|SHA256_ARM64_PLACEHOLDER|${SHA256_ARM64}|g" "${{ env.CASK_FILE }}"
+          sed -i "s|SHA256_INTEL_PLACEHOLDER|${SHA256_INTEL}|g" "${{ env.CASK_FILE }}"
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' "${{ env.CASK_FILE }}"
+
+          echo ""
+          echo "📄 Updated Cask file:"
+          echo "---"
+          cat "${{ env.CASK_FILE }}"
+          echo "---"
+
+      # -----------------------------------------------------------------------
+      # Step 7: Validate updated Cask (basic syntax check)
+      # -----------------------------------------------------------------------
+      - name: Validate Cask syntax
+        run: |
+          echo "🔍 Validating Cask syntax..."
+
+          # Basic Ruby syntax check
+          ruby -c "${{ env.CASK_FILE }}"
+
+          # Check that version, sha256, url are present
+          if ! grep -q 'version "' "${{ env.CASK_FILE }}"; then
+            echo "❌ Missing version field"
+            exit 1
+          fi
+          if ! grep -q 'sha256 arm:' "${{ env.CASK_FILE }}"; then
+            echo "❌ Missing sha256 field"
+            exit 1
+          fi
+          if ! grep -q 'url "' "${{ env.CASK_FILE }}"; then
+            echo "❌ Missing url field"
+            exit 1
+          fi
+
+          echo "✅ Cask syntax validation passed"
+
+      # -----------------------------------------------------------------------
+      # Step 8: Commit and push (skip if dry run)
+      # -----------------------------------------------------------------------
+      - name: Commit and push
+        if: ${{ !inputs.dry_run }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ env.CASK_FILE }}"
+
+          # Check if there are changes to commit
+          if git diff --cached --quiet; then
+            echo "ℹ️  No changes to commit (Cask already up to date)"
+            exit 0
+          fi
+
+          git commit -m "Update keyden to ${VERSION}"
+          git push
+
+          echo "✅ Cask updated and pushed (v${VERSION})"
+
+      # -----------------------------------------------------------------------
+      # Step 9: Summary
+      # -----------------------------------------------------------------------
+      - name: Summary
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          DRY_RUN="${{ inputs.dry_run || 'false' }}"
+
+          echo "## 🎉 Cask Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${VERSION}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`${TAG}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA256 (arm64) | \`${{ steps.assets.outputs.sha256_arm64 }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA256 (x86_64) | \`${{ steps.assets.outputs.sha256_intel }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | \`${DRY_RUN}\` |" >> $GITHUB_STEP_SUMMARY
