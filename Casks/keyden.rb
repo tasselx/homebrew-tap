@@ -11,7 +11,7 @@ cask "keyden" do
   desc "macOS menu bar TOTP authenticator"
   homepage "https://tasselx.github.io/Keyden/"
 
-  depends_on macos: ">= :monterey"
+  depends_on macos: :monterey
 
   app "Keyden.app"
 
